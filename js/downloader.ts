@@ -4,90 +4,115 @@ import { addMetadataWithTagLib } from './taglib.ts';
 const CLIENT_ID = 'txNoH4kkV41MfH25';
 const CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
 const PROXY = 'https://audio-proxy.binimum.org/proxy-audio?url=';
+const LS_KEY = 'monochrome_dl_user_token';
 
-// Community proxy instances — same list as api.js / ServerAPI
-const UPTIME_URLS = [
-    'https://tidal-uptime.jiffy-puffs-1j.workers.dev/',
-    'https://tidal-uptime.props-76styles.workers.dev/',
-];
-const FALLBACK_INSTANCES = [
-    'https://eu-central.monochrome.tf',
-    'https://us-west.monochrome.tf',
-    'https://arran.monochrome.tf',
-    'https://triton.squid.wtf',
-    'https://api.monochrome.tf',
-    'https://monochrome-api.samidy.com',
-    'https://maus.qqdl.site',
-    'https://vogel.qqdl.site',
-    'https://katze.qqdl.site',
-    'https://hund.qqdl.site',
-    'https://tidal.kinoplus.online',
-    'https://wolf.qqdl.site',
-];
+// ─── User auth (device code flow) ────────────────────────────────────────────
 
-let cachedInstances: string[] | null = null;
-
-async function getProxyInstances(): Promise<string[]> {
-    if (cachedInstances) return cachedInstances;
-    for (const url of UPTIME_URLS) {
-        try {
-            const res = await fetch(url);
-            if (!res.ok) continue;
-            const data = await res.json() as { api?: ({ url?: string } | string)[] };
-            const list = (data.api ?? [])
-                .map((i) => (typeof i === 'string' ? i : (i.url ?? '')))
-                .filter(Boolean);
-            if (list.length) { cachedInstances = list; return list; }
-        } catch { /* try next uptime worker */ }
-    }
-    cachedInstances = [...FALLBACK_INSTANCES];
-    return cachedInstances;
+interface StoredToken {
+    access_token: string;
+    refresh_token: string;
+    expires_at: number;
 }
 
-async function proxyFetch(path: string): Promise<Response> {
-    // Strategy 1: Vite dev-server reverse proxy (server-to-server, no CORS/origin issues)
-    if (import.meta.env.DEV) {
-        try {
-            const devUrl = `/hifi-proxy${path}`;
-            dbg(`Trying Vite dev proxy: ${devUrl}`);
-            const res = await fetch(devUrl);
-            if (res.ok) { dbg(`Dev proxy OK`); return res; }
-            const body = await res.text().catch(() => '');
-            dbg(`Dev proxy → ${res.status}: ${body.slice(0, 120)}`);
-        } catch (e) { dbg(`Dev proxy threw: ${(e as Error).message}`); }
-    }
-
-    // Strategy 2: Direct to community proxy instances
-    const instances = await getProxyInstances();
-    let lastErr: Error = new Error('No proxy instances available');
-    for (const base of instances.slice(0, 4)) {
-        const url = base.endsWith('/') ? `${base}${path.slice(1)}` : `${base}${path}`;
-        try {
-            const res = await fetch(url);
-            if (res.ok) { dbg(`Proxy OK: ${base}`); return res; }
-            const body = await res.text().catch(() => '');
-            dbg(`Proxy ${base} → ${res.status}: ${body.slice(0, 120)}`);
-        } catch (e) { lastErr = e as Error; dbg(`Proxy ${base} threw: ${(e as Error).message}`); }
-    }
-    throw lastErr;
+function loadStoredToken(): StoredToken | null {
+    try { return JSON.parse(localStorage.getItem(LS_KEY) ?? 'null'); } catch { return null; }
 }
 
-async function getFullPlaybackInfo(id: string, quality = 'LOSSLESS'): Promise<PlaybackInfo> {
-    dbg(`Fetching playback info via proxy (quality=${quality})…`);
-    const res = await proxyFetch(`/track/?id=${id}&quality=${quality}`);
-    const json = await res.json() as { version?: string; data?: PlaybackInfo } | PlaybackInfo;
-    // Proxy wraps response in { version, data } — unwrap if present
-    const data = ('data' in json && json.data ? json.data : json) as PlaybackInfo;
-    dbg(`assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality} bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
-    return data;
+function saveToken(t: StoredToken): void {
+    localStorage.setItem(LS_KEY, JSON.stringify(t));
 }
 
-let cachedToken: string | null = null;
-let tokenExpiry = 0;
+function clearToken(): void {
+    localStorage.removeItem(LS_KEY);
+}
 
-async function getToken(): Promise<string> {
-    if (cachedToken && Date.now() < tokenExpiry) { dbg('Auth: using cached token'); return cachedToken!; }
-    dbg('Auth: fetching new token…');
+async function refreshUserToken(refreshToken: string): Promise<StoredToken> {
+    const res = await fetch('https://auth.tidal.com/v1/oauth2/token', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: 'Basic ' + btoa(`${CLIENT_ID}:${CLIENT_SECRET}`),
+        },
+        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+    });
+    if (!res.ok) { clearToken(); throw new Error(`Token refresh failed: ${res.status}`); }
+    const d = await res.json();
+    const stored: StoredToken = {
+        access_token: d.access_token,
+        refresh_token: d.refresh_token ?? refreshToken,
+        expires_at: Date.now() + (d.expires_in - 60) * 1000,
+    };
+    saveToken(stored);
+    return stored;
+}
+
+async function getUserToken(): Promise<string | null> {
+    let stored = loadStoredToken();
+    if (!stored) return null;
+    if (Date.now() >= stored.expires_at) {
+        dbg('User token expired, refreshing…');
+        try { stored = await refreshUserToken(stored.refresh_token); }
+        catch { return null; }
+    }
+    return stored.access_token;
+}
+
+// Device code login — returns when user completes auth or throws on timeout
+export async function startDeviceLogin(
+    onCode: (userCode: string, verificationUrl: string) => void
+): Promise<void> {
+    const res = await fetch('https://auth.tidal.com/v1/oauth2/device_authorization', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: 'Basic ' + btoa(`${CLIENT_ID}:${CLIENT_SECRET}`),
+        },
+        body: new URLSearchParams({ client_id: CLIENT_ID, scope: 'r_usr w_usr' }),
+    });
+    if (!res.ok) throw new Error(`Device auth failed: ${res.status}`);
+    const d = await res.json();
+    dbg(`Device code: ${d.user_code}, expires in ${d.expires_in}s, poll every ${d.interval}s`);
+    onCode(d.user_code, d.verification_uri_complete ?? 'https://tidal.com/activate');
+
+    const interval = (d.interval ?? 5) * 1000;
+    const deadline = Date.now() + d.expires_in * 1000;
+
+    while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, interval));
+        const poll = await fetch('https://auth.tidal.com/v1/oauth2/token', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Authorization: 'Basic ' + btoa(`${CLIENT_ID}:${CLIENT_SECRET}`),
+            },
+            body: new URLSearchParams({
+                grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+                device_code: d.device_code,
+                client_id: CLIENT_ID,
+            }),
+        });
+        if (poll.status === 400) continue; // authorization_pending
+        if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
+        const t = await poll.json();
+        saveToken({
+            access_token: t.access_token,
+            refresh_token: t.refresh_token,
+            expires_at: Date.now() + (t.expires_in - 60) * 1000,
+        });
+        dbg('User login complete, token saved');
+        return;
+    }
+    throw new Error('Login timed out — please try again');
+}
+
+// ─── Shared token getter (user token preferred, falls back to client creds) ──
+
+let clientToken: string | null = null;
+let clientTokenExpiry = 0;
+
+async function getClientToken(): Promise<string> {
+    if (clientToken && Date.now() < clientTokenExpiry) return clientToken!;
+    dbg('Fetching client credentials token…');
     const res = await fetch('https://auth.tidal.com/v1/oauth2/token', {
         method: 'POST',
         headers: {
@@ -96,21 +121,48 @@ async function getToken(): Promise<string> {
         },
         body: new URLSearchParams({ grant_type: 'client_credentials', client_id: CLIENT_ID }),
     });
-    if (!res.ok) throw new Error(`Auth failed: ${res.status}`);
-    const data = await res.json();
-    cachedToken = data.access_token;
-    tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-    dbg(`Auth: token OK, expires in ${data.expires_in}s`);
-    return cachedToken!;
+    if (!res.ok) throw new Error(`Client auth failed: ${res.status}`);
+    const d = await res.json();
+    clientToken = d.access_token;
+    clientTokenExpiry = Date.now() + (d.expires_in - 60) * 1000;
+    dbg(`Client token OK (expires in ${d.expires_in}s)`);
+    return clientToken!;
+}
+
+async function getBestToken(): Promise<{ token: string; isUser: boolean }> {
+    const user = await getUserToken();
+    if (user) { dbg('Using user token'); return { token: user, isUser: true }; }
+    dbg('No user token — using client credentials (metadata only)');
+    return { token: await getClientToken(), isUser: false };
 }
 
 async function tidalGet(path: string, params: Record<string, string> = {}): Promise<unknown> {
-    const token = await getToken();
+    const { token } = await getBestToken();
     const url = new URL(path.startsWith('http') ? path : `https://api.tidal.com${path}`);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) throw new Error(`TIDAL ${res.status}: ${url.pathname}`);
     return res.json();
+}
+
+async function getFullPlaybackInfo(id: string, quality = 'LOSSLESS'): Promise<PlaybackInfo> {
+    const { token, isUser } = await getBestToken();
+    if (!isUser) throw new Error('TIDAL login required for full track access. Please log in first.');
+    dbg(`Fetching playback info directly from TIDAL (quality=${quality})…`);
+    const url = new URL(`https://api.tidal.com/v1/tracks/${id}/playbackinfo`);
+    url.searchParams.set('audioquality', quality);
+    url.searchParams.set('playbackmode', 'STREAM');
+    url.searchParams.set('assetpresentation', 'FULL');
+    url.searchParams.set('countryCode', 'US');
+    const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        dbg(`Playback info ${res.status}: ${body.slice(0, 200)}`);
+        throw new Error(`Playback info failed: ${res.status}`);
+    }
+    const data = await res.json() as PlaybackInfo;
+    dbg(`assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality} bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
+    return data;
 }
 
 function parseTidalId(input: string): string | null {
@@ -286,6 +338,55 @@ function sanitizeFilename(s: string): string {
 }
 
 // ─── UI wiring ───────────────────────────────────────────────────────────────
+
+const loginBtn = document.getElementById('login-btn') as HTMLButtonElement;
+const logoutBtn = document.getElementById('logout-btn') as HTMLButtonElement;
+const loginStatus = document.getElementById('login-status') as HTMLElement;
+const deviceCodeWrap = document.getElementById('device-code-wrap') as HTMLElement;
+const deviceCodeEl = document.getElementById('device-code') as HTMLElement;
+
+async function updateLoginUI(): Promise<void> {
+    const token = await getUserToken();
+    if (token) {
+        loginStatus.textContent = 'Logged in to TIDAL ✓';
+        loginStatus.style.color = '#4cde80';
+        loginBtn.hidden = true;
+        logoutBtn.hidden = false;
+        deviceCodeWrap.hidden = true;
+    } else {
+        loginStatus.textContent = 'Not logged in — full track download requires TIDAL login.';
+        loginStatus.style.color = '#666';
+        loginBtn.hidden = false;
+        logoutBtn.hidden = true;
+    }
+}
+
+loginBtn.addEventListener('click', async () => {
+    loginBtn.disabled = true;
+    loginBtn.textContent = 'Starting…';
+    try {
+        await startDeviceLogin((code, url) => {
+            deviceCodeWrap.hidden = false;
+            deviceCodeEl.textContent = code;
+            loginStatus.textContent = 'Waiting for TIDAL login…';
+            loginBtn.hidden = true;
+        });
+        await updateLoginUI();
+    } catch (e) {
+        loginStatus.textContent = `Login failed: ${(e as Error).message}`;
+        loginStatus.style.color = '#e05555';
+        deviceCodeWrap.hidden = true;
+        loginBtn.disabled = false;
+        loginBtn.textContent = 'Login';
+    }
+});
+
+logoutBtn.addEventListener('click', () => {
+    clearToken();
+    updateLoginUI();
+});
+
+updateLoginUI();
 
 const input = document.getElementById('track-url') as HTMLInputElement;
 const fetchBtn = document.getElementById('fetch-btn') as HTMLButtonElement;
