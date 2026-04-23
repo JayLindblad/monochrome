@@ -5,7 +5,68 @@ const CLIENT_ID = 'txNoH4kkV41MfH25';
 const CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
 const PROXY = 'https://audio-proxy.binimum.org/proxy-audio?url=';
 
-// ─── Auth (client credentials — same as main app, no user login needed) ──────
+// ─── Community proxy instances (hold subscriber tokens → assetPresentation=FULL) ─
+
+const UPTIME_URLS = [
+    'https://tidal-uptime.jiffy-puffs-1j.workers.dev/',
+    'https://tidal-uptime.props-76styles.workers.dev/',
+];
+const FALLBACK_INSTANCES = [
+    'https://eu-central.monochrome.tf',
+    'https://us-west.monochrome.tf',
+    'https://arran.monochrome.tf',
+    'https://triton.squid.wtf',
+    'https://api.monochrome.tf',
+    'https://monochrome-api.samidy.com',
+    'https://maus.qqdl.site',
+    'https://vogel.qqdl.site',
+    'https://katze.qqdl.site',
+    'https://hund.qqdl.site',
+    'https://tidal.kinoplus.online',
+    'https://wolf.qqdl.site',
+];
+
+let cachedInstances: string[] | null = null;
+
+async function getProxyInstances(): Promise<string[]> {
+    if (cachedInstances) return cachedInstances;
+    const urls = [...UPTIME_URLS].sort(() => Math.random() - 0.5);
+    for (const url of urls) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) continue;
+            const data = await res.json() as { api?: ({ url?: string } | string)[] };
+            const list = (data.api ?? [])
+                .map((i) => typeof i === 'string' ? i : (i.url ?? ''))
+                .filter(Boolean);
+            if (list.length) { cachedInstances = list; dbg(`Got ${list.length} instances from uptime`); return list; }
+        } catch { /* try next uptime URL */ }
+    }
+    dbg('Uptime fetch failed, using fallback instance list');
+    cachedInstances = FALLBACK_INSTANCES;
+    return FALLBACK_INSTANCES;
+}
+
+async function proxyFetch(path: string): Promise<Response> {
+    const instances = await getProxyInstances();
+    let lastErr: Error = new Error('No proxy instances available');
+    for (const base of instances) {
+        const url = base.endsWith('/') ? `${base}${path.slice(1)}` : `${base}${path}`;
+        dbg(`Proxy attempt: ${url}`);
+        try {
+            const res = await fetch(url);
+            if (res.ok) { dbg(`Proxy hit: ${url}`); return res; }
+            dbg(`Proxy ${url} → ${res.status}`);
+            lastErr = new Error(`HTTP ${res.status} from ${base}`);
+        } catch (e) {
+            dbg(`Proxy ${base} threw: ${(e as Error).message}`);
+            lastErr = e as Error;
+        }
+    }
+    throw lastErr;
+}
+
+// ─── Auth (client credentials — for metadata only) ───────────────────────────
 
 let cachedToken: string | null = null;
 let tokenExpiry = 0;
@@ -38,16 +99,15 @@ async function tidalGet(path: string, params: Record<string, string> = {}): Prom
     return res.json();
 }
 
+// Playback info must go through the community proxy — client_credentials always
+// returns assetPresentation=PREVIEW regardless of the assetpresentation param.
+// The proxy instances hold subscriber tokens and return FULL manifests.
 async function getFullPlaybackInfo(id: string, quality = 'LOSSLESS'): Promise<PlaybackInfo> {
-    dbg(`Fetching playback info (quality=${quality})…`);
-    // client_credentials token + assetpresentation=FULL gives the complete track manifest,
-    // matching what HiFiClient.getTrack() does in the main app (HiFi.ts:1471)
-    const data = await tidalGet(`/v1/tracks/${id}/playbackinfo`, {
-        audioquality: quality,
-        playbackmode: 'STREAM',
-        assetpresentation: 'FULL',
-        countryCode: 'US',
-    }) as PlaybackInfo;
+    dbg(`Fetching playback info via proxy (quality=${quality})…`);
+    const res = await proxyFetch(`/track/?id=${id}&quality=${quality}`);
+    const json = await res.json() as { version?: string; data?: PlaybackInfo } | PlaybackInfo;
+    // Proxy may wrap response in { version, data } envelope
+    const data = ('data' in json && json.data ? json.data : json) as PlaybackInfo;
     dbg(`assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality} bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
     return data;
 }
