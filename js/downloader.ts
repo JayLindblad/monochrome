@@ -363,7 +363,7 @@ fetchBtn.addEventListener('click', async () => {
         setStatus('Fetching track info…', 0);
         const [meta, playback] = await Promise.all([
             tidalGet(`/v1/tracks/${trackId}/`, { countryCode: 'US' }) as Promise<TrackMeta>,
-            getFullPlaybackInfo(trackId),
+            getFullPlaybackInfo(trackId, 'HI_RES_LOSSLESS'),
         ]);
 
         currentMeta = meta;
@@ -378,8 +378,9 @@ fetchBtn.addEventListener('click', async () => {
         albumEl.textContent = meta.album.title;
 
         const q = playback.audioQuality ?? meta.audioQuality;
-        qualityBadge.textContent = q.replace('_', ' ');
-        qualityBadge.className = 'quality-badge ' + (q.includes('HI_RES') ? 'hires' : 'lossless');
+        const isLossy = q === 'HIGH' || q === 'LOW';
+        qualityBadge.textContent = q.replace(/_/g, ' ');
+        qualityBadge.className = 'quality-badge ' + (q.includes('HI_RES') ? 'hires' : isLossy ? 'lossy' : 'lossless');
 
         const bd = playback.bitDepth ?? '—';
         const sr = playback.sampleRate ? (playback.sampleRate / 1000).toFixed(1) + ' kHz' : '—';
@@ -409,30 +410,43 @@ downloadBtn.addEventListener('click', async () => {
         dbg(`Manifest mimeType: ${currentPlayback.manifestMimeType}`);
         const raw = atob(currentPlayback.manifest);
         dbg(`Manifest decoded (first 200 chars): ${raw.slice(0, 200)}`);
-        let manifestXml: string;
+        let rawBlob: Blob;
 
         if (raw.trimStart().startsWith('<')) {
+            // Inline DASH XML
             dbg('Manifest type: DASH XML (inline)');
-            manifestXml = raw;
+            setStatus('Downloading audio segments…', 5);
+            rawBlob = await downloadDash(raw, (pct) => {
+                setStatus(`Downloading audio… ${Math.round(pct * 100)}%`, 5 + pct * 60);
+            });
         } else {
-            const parsed = JSON.parse(raw) as { urls?: string[] };
-            dbg(`Manifest type: JSON, urls=${JSON.stringify(parsed.urls?.slice(0, 2))}`);
-            if (parsed.urls?.[0]) {
-                dbg(`Fetching manifest from URL: ${parsed.urls[0]}`);
-                const res = await fetch(parsed.urls[0]);
-                dbg(`Manifest fetch: HTTP ${res.status}`);
-                manifestXml = await res.text();
-                dbg(`Manifest XML (first 200 chars): ${manifestXml.slice(0, 200)}`);
+            const parsed = JSON.parse(raw) as { mimeType?: string; urls?: string[]; codecs?: string };
+            dbg(`Manifest type: JSON, mimeType=${parsed.mimeType ?? 'none'}, codecs=${parsed.codecs ?? 'none'}`);
+            dbg(`Manifest urls[0]: ${(parsed.urls?.[0] ?? 'none').slice(0, 80)}…`);
+            if (!parsed.urls?.[0]) throw new Error('Unsupported manifest format — no urls');
+
+            if (parsed.mimeType?.startsWith('audio/')) {
+                // BTS format (application/vnd.tidal.bts): urls[] is the actual audio file, not a manifest
+                dbg('Manifest type: BTS (direct audio), downloading…');
+                setStatus('Downloading audio…', 5);
+                const audioRes = await fetch(parsed.urls[0]);
+                if (!audioRes.ok) throw new Error(`Audio fetch failed: ${audioRes.status}`);
+                rawBlob = new Blob([await audioRes.arrayBuffer()], { type: parsed.mimeType });
+                dbg(`BTS download complete: ${rawBlob.size} bytes, type=${parsed.mimeType}`);
+                setStatus('Downloading audio…', 65);
             } else {
-                throw new Error('Unsupported manifest format');
+                // urls[] points to a remote DASH manifest XML
+                dbg(`Fetching remote DASH manifest: ${parsed.urls[0].slice(0, 80)}…`);
+                const mRes = await fetch(parsed.urls[0]);
+                if (!mRes.ok) throw new Error(`Manifest fetch failed: ${mRes.status}`);
+                const manifestXml = await mRes.text();
+                dbg(`Remote manifest (first 200): ${manifestXml.slice(0, 200)}`);
+                setStatus('Downloading audio segments…', 5);
+                rawBlob = await downloadDash(manifestXml, (pct) => {
+                    setStatus(`Downloading audio… ${Math.round(pct * 100)}%`, 5 + pct * 60);
+                });
             }
         }
-
-        // Download DASH segments
-        setStatus('Downloading audio segments…', 5);
-        const rawBlob = await downloadDash(manifestXml, (pct) => {
-            setStatus(`Downloading audio… ${Math.round(pct * 100)}%`, 5 + pct * 60);
-        });
 
         // Re-encode to FLAC — using -c:a flac (not -c copy) resets DASH timestamp offsets to 0
         setStatus('Encoding to FLAC…', 67);
