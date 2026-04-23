@@ -68,14 +68,6 @@ export default defineConfig((_options) => {
                 // host: true,
                 // allowedHosts: ['<your_tailscale_hostname>'], // e.g. pi5.tailf5f622.ts.net
             },
-            proxy: {
-                // Server-to-server proxy for downloader.html — avoids browser CORS/origin restrictions
-                '/hifi-proxy': {
-                    target: 'https://eu-central.monochrome.tf',
-                    changeOrigin: true,
-                    rewrite: (path) => path.replace(/^\/hifi-proxy/, ''),
-                },
-            },
         },
         // preview: {
         //     host: true,

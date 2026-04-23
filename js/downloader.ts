@@ -1,118 +1,18 @@
-import { ffmpegNewContainer } from './ffmpeg.js';
+import { ffmpeg } from './ffmpeg.js';
 import { addMetadataWithTagLib } from './taglib.ts';
 
 const CLIENT_ID = 'txNoH4kkV41MfH25';
 const CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
 const PROXY = 'https://audio-proxy.binimum.org/proxy-audio?url=';
-const LS_KEY = 'monochrome_dl_user_token';
 
-// ─── User auth (device code flow) ────────────────────────────────────────────
+// ─── Auth (client credentials — same as main app, no user login needed) ──────
 
-interface StoredToken {
-    access_token: string;
-    refresh_token: string;
-    expires_at: number;
-}
+let cachedToken: string | null = null;
+let tokenExpiry = 0;
 
-function loadStoredToken(): StoredToken | null {
-    try { return JSON.parse(localStorage.getItem(LS_KEY) ?? 'null'); } catch { return null; }
-}
-
-function saveToken(t: StoredToken): void {
-    localStorage.setItem(LS_KEY, JSON.stringify(t));
-}
-
-function clearToken(): void {
-    localStorage.removeItem(LS_KEY);
-}
-
-async function refreshUserToken(refreshToken: string): Promise<StoredToken> {
-    const res = await fetch('https://auth.tidal.com/v1/oauth2/token', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Authorization: 'Basic ' + btoa(`${CLIENT_ID}:${CLIENT_SECRET}`),
-        },
-        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
-    });
-    if (!res.ok) { clearToken(); throw new Error(`Token refresh failed: ${res.status}`); }
-    const d = await res.json();
-    const stored: StoredToken = {
-        access_token: d.access_token,
-        refresh_token: d.refresh_token ?? refreshToken,
-        expires_at: Date.now() + (d.expires_in - 60) * 1000,
-    };
-    saveToken(stored);
-    return stored;
-}
-
-async function getUserToken(): Promise<string | null> {
-    let stored = loadStoredToken();
-    if (!stored) return null;
-    if (Date.now() >= stored.expires_at) {
-        dbg('User token expired, refreshing…');
-        try { stored = await refreshUserToken(stored.refresh_token); }
-        catch { return null; }
-    }
-    return stored.access_token;
-}
-
-// Device code login — returns when user completes auth or throws on timeout
-export async function startDeviceLogin(
-    onCode: (userCode: string, verificationUrl: string) => void
-): Promise<void> {
-    const res = await fetch('https://auth.tidal.com/v1/oauth2/device_authorization', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Authorization: 'Basic ' + btoa(`${CLIENT_ID}:${CLIENT_SECRET}`),
-        },
-        body: new URLSearchParams({ client_id: CLIENT_ID, scope: 'r_usr w_usr' }),
-    });
-    if (!res.ok) throw new Error(`Device auth failed: ${res.status}`);
-    const d = await res.json();
-    dbg(`Device code: ${d.user_code}, expires in ${d.expires_in}s, poll every ${d.interval}s`);
-    onCode(d.user_code, d.verification_uri_complete ?? 'https://tidal.com/activate');
-
-    const interval = (d.interval ?? 5) * 1000;
-    const deadline = Date.now() + d.expires_in * 1000;
-
-    while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, interval));
-        const poll = await fetch('https://auth.tidal.com/v1/oauth2/token', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                Authorization: 'Basic ' + btoa(`${CLIENT_ID}:${CLIENT_SECRET}`),
-            },
-            body: new URLSearchParams({
-                grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-                device_code: d.device_code,
-                client_id: CLIENT_ID,
-            }),
-        });
-        if (poll.status === 400) continue; // authorization_pending
-        if (!poll.ok) throw new Error(`Poll failed: ${poll.status}`);
-        const t = await poll.json();
-        saveToken({
-            access_token: t.access_token,
-            refresh_token: t.refresh_token,
-            expires_at: Date.now() + (t.expires_in - 60) * 1000,
-        });
-        dbg('User login complete, token saved');
-        return;
-    }
-    throw new Error('Login timed out — please try again');
-}
-
-// ─── Shared token getter (user token preferred, falls back to client creds) ──
-
-let clientToken: string | null = null;
-let clientTokenExpiry = 0;
-
-async function getClientToken(): Promise<string> {
-    if (clientToken && Date.now() < clientTokenExpiry) return clientToken!;
-    dbg('Fetching client credentials token…');
+async function getToken(): Promise<string> {
+    if (cachedToken && Date.now() < tokenExpiry) { dbg('Auth: using cached token'); return cachedToken!; }
+    dbg('Auth: fetching client credentials token…');
     const res = await fetch('https://auth.tidal.com/v1/oauth2/token', {
         method: 'POST',
         headers: {
@@ -121,23 +21,16 @@ async function getClientToken(): Promise<string> {
         },
         body: new URLSearchParams({ grant_type: 'client_credentials', client_id: CLIENT_ID }),
     });
-    if (!res.ok) throw new Error(`Client auth failed: ${res.status}`);
+    if (!res.ok) throw new Error(`Auth failed: ${res.status}`);
     const d = await res.json();
-    clientToken = d.access_token;
-    clientTokenExpiry = Date.now() + (d.expires_in - 60) * 1000;
-    dbg(`Client token OK (expires in ${d.expires_in}s)`);
-    return clientToken!;
-}
-
-async function getBestToken(): Promise<{ token: string; isUser: boolean }> {
-    const user = await getUserToken();
-    if (user) { dbg('Using user token'); return { token: user, isUser: true }; }
-    dbg('No user token — using client credentials (metadata only)');
-    return { token: await getClientToken(), isUser: false };
+    cachedToken = d.access_token;
+    tokenExpiry = Date.now() + (d.expires_in - 60) * 1000;
+    dbg(`Auth: token OK, expires in ${d.expires_in}s`);
+    return cachedToken!;
 }
 
 async function tidalGet(path: string, params: Record<string, string> = {}): Promise<unknown> {
-    const { token } = await getBestToken();
+    const token = await getToken();
     const url = new URL(path.startsWith('http') ? path : `https://api.tidal.com${path}`);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
@@ -146,21 +39,15 @@ async function tidalGet(path: string, params: Record<string, string> = {}): Prom
 }
 
 async function getFullPlaybackInfo(id: string, quality = 'LOSSLESS'): Promise<PlaybackInfo> {
-    const { token, isUser } = await getBestToken();
-    if (!isUser) throw new Error('TIDAL login required for full track access. Please log in first.');
-    dbg(`Fetching playback info directly from TIDAL (quality=${quality})…`);
-    const url = new URL(`https://api.tidal.com/v1/tracks/${id}/playbackinfo`);
-    url.searchParams.set('audioquality', quality);
-    url.searchParams.set('playbackmode', 'STREAM');
-    url.searchParams.set('assetpresentation', 'FULL');
-    url.searchParams.set('countryCode', 'US');
-    const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        dbg(`Playback info ${res.status}: ${body.slice(0, 200)}`);
-        throw new Error(`Playback info failed: ${res.status}`);
-    }
-    const data = await res.json() as PlaybackInfo;
+    dbg(`Fetching playback info (quality=${quality})…`);
+    // client_credentials token + assetpresentation=FULL gives the complete track manifest,
+    // matching what HiFiClient.getTrack() does in the main app (HiFi.ts:1471)
+    const data = await tidalGet(`/v1/tracks/${id}/playbackinfo`, {
+        audioquality: quality,
+        playbackmode: 'STREAM',
+        assetpresentation: 'FULL',
+        countryCode: 'US',
+    }) as PlaybackInfo;
     dbg(`assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality} bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
     return data;
 }
@@ -339,55 +226,6 @@ function sanitizeFilename(s: string): string {
 
 // ─── UI wiring ───────────────────────────────────────────────────────────────
 
-const loginBtn = document.getElementById('login-btn') as HTMLButtonElement;
-const logoutBtn = document.getElementById('logout-btn') as HTMLButtonElement;
-const loginStatus = document.getElementById('login-status') as HTMLElement;
-const deviceCodeWrap = document.getElementById('device-code-wrap') as HTMLElement;
-const deviceCodeEl = document.getElementById('device-code') as HTMLElement;
-
-async function updateLoginUI(): Promise<void> {
-    const token = await getUserToken();
-    if (token) {
-        loginStatus.textContent = 'Logged in to TIDAL ✓';
-        loginStatus.style.color = '#4cde80';
-        loginBtn.hidden = true;
-        logoutBtn.hidden = false;
-        deviceCodeWrap.hidden = true;
-    } else {
-        loginStatus.textContent = 'Not logged in — full track download requires TIDAL login.';
-        loginStatus.style.color = '#666';
-        loginBtn.hidden = false;
-        logoutBtn.hidden = true;
-    }
-}
-
-loginBtn.addEventListener('click', async () => {
-    loginBtn.disabled = true;
-    loginBtn.textContent = 'Starting…';
-    try {
-        await startDeviceLogin((code, url) => {
-            deviceCodeWrap.hidden = false;
-            deviceCodeEl.textContent = code;
-            loginStatus.textContent = 'Waiting for TIDAL login…';
-            loginBtn.hidden = true;
-        });
-        await updateLoginUI();
-    } catch (e) {
-        loginStatus.textContent = `Login failed: ${(e as Error).message}`;
-        loginStatus.style.color = '#e05555';
-        deviceCodeWrap.hidden = true;
-        loginBtn.disabled = false;
-        loginBtn.textContent = 'Login';
-    }
-});
-
-logoutBtn.addEventListener('click', () => {
-    clearToken();
-    updateLoginUI();
-});
-
-updateLoginUI();
-
 const input = document.getElementById('track-url') as HTMLInputElement;
 const fetchBtn = document.getElementById('fetch-btn') as HTMLButtonElement;
 const card = document.getElementById('track-card') as HTMLDivElement;
@@ -419,6 +257,7 @@ interface PlaybackInfo {
     bitDepth?: number;
     sampleRate?: number;
     audioQuality: string;
+    assetPresentation?: string;
     manifest: string;
     manifestMimeType: string;
 }
@@ -535,9 +374,13 @@ downloadBtn.addEventListener('click', async () => {
             setStatus(`Downloading audio… ${Math.round(pct * 100)}%`, 5 + pct * 60);
         });
 
-        // Remux to FLAC container
-        setStatus('Remuxing to FLAC…', 67);
-        const flacBlob = await ffmpegNewContainer(rawBlob, 'flac', 'audio/flac', null, null);
+        // Re-encode to FLAC — using -c:a flac (not -c copy) resets DASH timestamp offsets to 0
+        setStatus('Encoding to FLAC…', 67);
+        const flacBlob = await ffmpeg(rawBlob, {
+            args: ['-map_metadata', '-1', '-c:a', 'flac'],
+            outputName: 'output.flac',
+            outputMime: 'audio/flac',
+        });
 
         // Fetch cover art for embedding
         setStatus('Embedding metadata…', 80);
