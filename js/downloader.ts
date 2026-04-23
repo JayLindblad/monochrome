@@ -9,7 +9,8 @@ let cachedToken: string | null = null;
 let tokenExpiry = 0;
 
 async function getToken(): Promise<string> {
-    if (cachedToken && Date.now() < tokenExpiry) return cachedToken!;
+    if (cachedToken && Date.now() < tokenExpiry) { dbg('Auth: using cached token'); return cachedToken!; }
+    dbg('Auth: fetching new token…');
     const res = await fetch('https://auth.tidal.com/v1/oauth2/token', {
         method: 'POST',
         headers: {
@@ -22,6 +23,7 @@ async function getToken(): Promise<string> {
     const data = await res.json();
     cachedToken = data.access_token;
     tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+    dbg(`Auth: token OK, expires in ${data.expires_in}s`);
     return cachedToken!;
 }
 
@@ -56,7 +58,22 @@ function coverUrl(uuid: string, size = 1280): string {
 
 function proxyUrlFn(url: string): string {
     if (url.startsWith('blob:')) return url;
-    return `${PROXY}${encodeURIComponent(url)}`;
+    // Proxy expects raw URL, not percent-encoded (matches existing proxy-utils.js behaviour)
+    return `${PROXY}${url}`;
+}
+
+// ─── Debug log ───────────────────────────────────────────────────────────────
+const debugLines: string[] = [];
+function dbg(msg: string): void {
+    const ts = new Date().toISOString().slice(11, 23);
+    const line = `[${ts}] ${msg}`;
+    debugLines.push(line);
+    console.log(line);
+    const el = document.getElementById('debug-log');
+    if (el) {
+        el.textContent = debugLines.slice(-80).join('\n');
+        el.scrollTop = el.scrollHeight;
+    }
 }
 
 function resolveTemplate(tpl: string, repId: string, num: number, time: number): string {
@@ -136,11 +153,25 @@ async function downloadDash(manifestXml: string, onProgress: (pct: number) => vo
     const mimeType = audioSet.getAttribute('mimeType') ?? 'audio/mp4';
     const chunks: ArrayBuffer[] = [];
 
+    dbg(`DASH: ${urls.length} segments, mimeType=${mimeType}`);
+    dbg(`DASH seg[0] raw: ${urls[0]}`);
+    dbg(`DASH seg[0] proxied: ${proxyUrlFn(urls[0])}`);
+
     for (let i = 0; i < urls.length; i++) {
         onProgress(i / urls.length);
-        const res = await fetch(proxyUrlFn(urls[i]));
-        if (!res.ok) throw new Error(`Segment ${i} fetch failed: ${res.status}`);
-        chunks.push(await res.arrayBuffer());
+        const proxied = proxyUrlFn(urls[i]);
+        const res = await fetch(proxied);
+        if (!res.ok) {
+            dbg(`Segment ${i} FAILED: HTTP ${res.status} — URL: ${proxied}`);
+            // Log response headers for diagnosis
+            const hdrs: string[] = [];
+            res.headers.forEach((v, k) => hdrs.push(`${k}: ${v}`));
+            dbg(`Response headers: ${hdrs.join(' | ')}`);
+            throw new Error(`Segment ${i} fetch failed: ${res.status} (see debug log for URL)`);
+        }
+        const buf = await res.arrayBuffer();
+        dbg(`Segment ${i} OK: ${buf.byteLength} bytes`);
+        chunks.push(buf);
     }
     onProgress(1);
 
@@ -285,17 +316,24 @@ downloadBtn.addEventListener('click', async () => {
     try {
         // Decode the Base64 manifest
         setStatus('Decoding manifest…', 2);
+        dbg(`Playback: quality=${currentPlayback.audioQuality}, bitDepth=${currentPlayback.bitDepth}, sampleRate=${currentPlayback.sampleRate}`);
+        dbg(`Manifest mimeType: ${currentPlayback.manifestMimeType}`);
         const raw = atob(currentPlayback.manifest);
+        dbg(`Manifest decoded (first 200 chars): ${raw.slice(0, 200)}`);
         let manifestXml: string;
 
         if (raw.trimStart().startsWith('<')) {
+            dbg('Manifest type: DASH XML (inline)');
             manifestXml = raw;
         } else {
-            // JSON manifest with urls array
             const parsed = JSON.parse(raw) as { urls?: string[] };
+            dbg(`Manifest type: JSON, urls=${JSON.stringify(parsed.urls?.slice(0, 2))}`);
             if (parsed.urls?.[0]) {
+                dbg(`Fetching manifest from URL: ${parsed.urls[0]}`);
                 const res = await fetch(proxyUrlFn(parsed.urls[0]));
+                dbg(`Manifest fetch: HTTP ${res.status}`);
                 manifestXml = await res.text();
+                dbg(`Manifest XML (first 200 chars): ${manifestXml.slice(0, 200)}`);
             } else {
                 throw new Error('Unsupported manifest format');
             }

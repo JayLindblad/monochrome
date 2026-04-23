@@ -210,6 +210,42 @@
                 color: #e05555;
                 margin-bottom: 12px;
             }
+
+            /* ── Debug panel ────────────────────────────────────────────── */
+            #debug-wrap {
+                width: 100%;
+                max-width: 560px;
+                margin-top: 20px;
+            }
+
+            #debug-toggle {
+                background: none;
+                border: 1px solid #222;
+                color: #444;
+                font-size: 0.72rem;
+                padding: 4px 10px;
+                border-radius: 6px;
+                cursor: pointer;
+                margin-bottom: 6px;
+            }
+
+            #debug-toggle:hover { color: #777; border-color: #333; }
+
+            #debug-log {
+                width: 100%;
+                background: #080808;
+                border: 1px solid #1c1c1c;
+                border-radius: 6px;
+                padding: 10px 12px;
+                font-family: 'SF Mono', 'Fira Code', monospace;
+                font-size: 0.68rem;
+                color: #4a9;
+                white-space: pre-wrap;
+                word-break: break-all;
+                max-height: 260px;
+                overflow-y: auto;
+                line-height: 1.5;
+            }
         </style>
     </head>
     <body>
@@ -246,6 +282,15 @@
                 </div>
                 <button id="download-btn">Download FLAC</button>
             </div>
+        </div>
+
+        <div id="debug-wrap">
+            <button id="debug-toggle" onclick="
+                const log = document.getElementById('debug-log');
+                log.hidden = !log.hidden;
+                this.textContent = log.hidden ? 'Show debug log' : 'Hide debug log';
+            ">Show debug log</button>
+            <pre id="debug-log" hidden></pre>
         </div>
 
         <script type="module" src="./js/downloader.ts"></script>
