@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>FLAC Downloader · Monochrome</title>
+        <style>
+            *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                background: #000;
+                color: #e8e8e8;
+                min-height: 100dvh;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: flex-start;
+                padding: 48px 16px 80px;
+            }
+
+            h1 {
+                font-size: 1.1rem;
+                font-weight: 600;
+                letter-spacing: 0.04em;
+                color: #fff;
+                margin-bottom: 8px;
+            }
+
+            .subtitle {
+                font-size: 0.8rem;
+                color: #555;
+                margin-bottom: 32px;
+            }
+
+            .search-row {
+                display: flex;
+                gap: 8px;
+                width: 100%;
+                max-width: 560px;
+                margin-bottom: 24px;
+            }
+
+            input[type="text"] {
+                flex: 1;
+                padding: 11px 14px;
+                background: #111;
+                border: 1px solid #222;
+                border-radius: 8px;
+                color: #e8e8e8;
+                font-size: 0.875rem;
+                outline: none;
+                transition: border-color 0.15s;
+            }
+
+            input[type="text"]:focus { border-color: #444; }
+            input[type="text"]::placeholder { color: #444; }
+
+            button {
+                padding: 11px 20px;
+                border: none;
+                border-radius: 8px;
+                font-size: 0.875rem;
+                font-weight: 500;
+                cursor: pointer;
+                transition: opacity 0.15s, background 0.15s;
+            }
+
+            button:disabled { opacity: 0.45; cursor: default; }
+
+            #fetch-btn {
+                background: #fff;
+                color: #000;
+                white-space: nowrap;
+            }
+
+            #fetch-btn:hover:not(:disabled) { background: #ddd; }
+
+            /* ── Track card ─────────────────────────────────────────────── */
+            #track-card {
+                display: flex;
+                gap: 20px;
+                width: 100%;
+                max-width: 560px;
+                background: #0f0f0f;
+                border: 1px solid #1c1c1c;
+                border-radius: 12px;
+                padding: 20px;
+                margin-bottom: 16px;
+            }
+
+            #cover-img {
+                width: 120px;
+                height: 120px;
+                border-radius: 6px;
+                object-fit: cover;
+                background: #1a1a1a;
+                flex-shrink: 0;
+            }
+
+            .track-info {
+                flex: 1;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                justify-content: center;
+            }
+
+            #track-title {
+                font-size: 1rem;
+                font-weight: 600;
+                color: #fff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            #track-artist {
+                font-size: 0.85rem;
+                color: #aaa;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            #track-album {
+                font-size: 0.78rem;
+                color: #666;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .badges {
+                display: flex;
+                gap: 6px;
+                margin-top: 8px;
+                flex-wrap: wrap;
+                align-items: center;
+            }
+
+            .quality-badge {
+                font-size: 0.65rem;
+                font-weight: 700;
+                letter-spacing: 0.06em;
+                padding: 2px 7px;
+                border-radius: 4px;
+                text-transform: uppercase;
+            }
+
+            .quality-badge.lossless { background: #0f3d1e; color: #4cde80; }
+            .quality-badge.hires    { background: #1a2d5a; color: #5b9cf6; }
+
+            #track-tech {
+                font-size: 0.72rem;
+                color: #555;
+            }
+
+            #download-btn {
+                background: #1a1a1a;
+                color: #e8e8e8;
+                border: 1px solid #2a2a2a;
+                margin-top: auto;
+                align-self: flex-start;
+                padding: 8px 16px;
+                font-size: 0.8rem;
+                margin-top: 12px;
+            }
+
+            #download-btn:hover:not(:disabled) { background: #222; border-color: #333; }
+
+            /* ── Progress ───────────────────────────────────────────────── */
+            #progress-wrap {
+                width: 100%;
+                max-width: 560px;
+                margin-bottom: 12px;
+            }
+
+            progress {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 100%;
+                height: 3px;
+                border: none;
+                border-radius: 2px;
+                background: #1c1c1c;
+                display: block;
+                margin-bottom: 8px;
+            }
+
+            progress::-webkit-progress-bar   { background: #1c1c1c; border-radius: 2px; }
+            progress::-webkit-progress-value { background: #fff; border-radius: 2px; }
+            progress::-moz-progress-bar      { background: #fff; border-radius: 2px; }
+
+            #status-text {
+                font-size: 0.75rem;
+                color: #555;
+            }
+
+            /* ── Error ──────────────────────────────────────────────────── */
+            #error-msg {
+                width: 100%;
+                max-width: 560px;
+                background: #1f0a0a;
+                border: 1px solid #3d1111;
+                border-radius: 8px;
+                padding: 12px 14px;
+                font-size: 0.8rem;
+                color: #e05555;
+                margin-bottom: 12px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>FLAC Downloader</h1>
+        <p class="subtitle">Paste a TIDAL track link to fetch metadata and download lossless audio.</p>
+
+        <div class="search-row">
+            <input
+                id="track-url"
+                type="text"
+                placeholder="https://tidal.com/browse/track/12345678"
+                autocomplete="off"
+                spellcheck="false"
+            />
+            <button id="fetch-btn">Fetch</button>
+        </div>
+
+        <div id="error-msg" hidden></div>
+
+        <div id="progress-wrap" hidden>
+            <progress id="progress-bar" max="100" value="0"></progress>
+            <span id="status-text"></span>
+        </div>
+
+        <div id="track-card" hidden>
+            <img id="cover-img" src="" alt="Album art" />
+            <div class="track-info">
+                <div id="track-title"></div>
+                <div id="track-artist"></div>
+                <div id="track-album"></div>
+                <div class="badges">
+                    <span id="quality-badge" class="quality-badge lossless"></span>
+                    <span id="track-tech"></span>
+                </div>
+                <button id="download-btn">Download FLAC</button>
+            </div>
+        </div>
+
+        <script type="module" src="./js/downloader.ts"></script>
+    </body>
+</html>

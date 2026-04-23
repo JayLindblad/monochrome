@@ -85,6 +85,10 @@ export default defineConfig((_options) => {
                 },
             },
             rollupOptions: {
+                input: {
+                    main: path.resolve(__dirname, 'index.html'),
+                    downloader: path.resolve(__dirname, 'downloader.html'),
+                },
                 treeshake: true,
             },
         },
