@@ -5,6 +5,69 @@ const CLIENT_ID = 'txNoH4kkV41MfH25';
 const CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
 const PROXY = 'https://audio-proxy.binimum.org/proxy-audio?url=';
 
+// Community proxy instances — same list as api.js / ServerAPI
+const UPTIME_URLS = [
+    'https://tidal-uptime.jiffy-puffs-1j.workers.dev/',
+    'https://tidal-uptime.props-76styles.workers.dev/',
+];
+const FALLBACK_INSTANCES = [
+    'https://eu-central.monochrome.tf',
+    'https://us-west.monochrome.tf',
+    'https://arran.monochrome.tf',
+    'https://triton.squid.wtf',
+    'https://api.monochrome.tf',
+    'https://monochrome-api.samidy.com',
+    'https://maus.qqdl.site',
+    'https://vogel.qqdl.site',
+    'https://katze.qqdl.site',
+    'https://hund.qqdl.site',
+    'https://tidal.kinoplus.online',
+    'https://wolf.qqdl.site',
+];
+
+let cachedInstances: string[] | null = null;
+
+async function getProxyInstances(): Promise<string[]> {
+    if (cachedInstances) return cachedInstances;
+    for (const url of UPTIME_URLS) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) continue;
+            const data = await res.json() as { api?: ({ url?: string } | string)[] };
+            const list = (data.api ?? [])
+                .map((i) => (typeof i === 'string' ? i : (i.url ?? '')))
+                .filter(Boolean);
+            if (list.length) { cachedInstances = list; return list; }
+        } catch { /* try next uptime worker */ }
+    }
+    cachedInstances = [...FALLBACK_INSTANCES];
+    return cachedInstances;
+}
+
+async function proxyFetch(path: string): Promise<Response> {
+    const instances = await getProxyInstances();
+    let lastErr: Error = new Error('No proxy instances available');
+    for (const base of instances) {
+        const url = base.endsWith('/') ? `${base}${path.slice(1)}` : `${base}${path}`;
+        try {
+            const res = await fetch(url);
+            if (res.ok) { dbg(`Proxy OK: ${url}`); return res; }
+            dbg(`Proxy ${base} → ${res.status}`);
+        } catch (e) { lastErr = e as Error; dbg(`Proxy ${base} threw: ${(e as Error).message}`); }
+    }
+    throw lastErr;
+}
+
+async function getFullPlaybackInfo(id: string, quality = 'LOSSLESS'): Promise<PlaybackInfo> {
+    dbg(`Fetching playback info via proxy (quality=${quality})…`);
+    const res = await proxyFetch(`/track/?id=${id}&quality=${quality}`);
+    const json = await res.json() as { version?: string; data?: PlaybackInfo } | PlaybackInfo;
+    // Proxy wraps response in { version, data } — unwrap if present
+    const data = ('data' in json && json.data ? json.data : json) as PlaybackInfo;
+    dbg(`assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality} bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
+    return data;
+}
+
 let cachedToken: string | null = null;
 let tokenExpiry = 0;
 
@@ -283,15 +346,10 @@ fetchBtn.addEventListener('click', async () => {
     fetchBtn.textContent = 'Fetching…';
 
     try {
-        setStatus('Authenticating…', 0);
+        setStatus('Fetching track info…', 0);
         const [meta, playback] = await Promise.all([
             tidalGet(`/v1/tracks/${trackId}/`, { countryCode: 'US' }) as Promise<TrackMeta>,
-            tidalGet(`/v1/tracks/${trackId}/playbackinfo`, {
-                audioquality: 'LOSSLESS',
-                playbackmode: 'STREAM',
-                assetpresentation: 'FULL',
-                countryCode: 'US',
-            }) as Promise<PlaybackInfo>,
+            getFullPlaybackInfo(trackId),
         ]);
 
         currentMeta = meta;
