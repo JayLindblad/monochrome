@@ -45,14 +45,28 @@ async function getProxyInstances(): Promise<string[]> {
 }
 
 async function proxyFetch(path: string): Promise<Response> {
+    // Strategy 1: Vite dev-server reverse proxy (server-to-server, no CORS/origin issues)
+    if (import.meta.env.DEV) {
+        try {
+            const devUrl = `/hifi-proxy${path}`;
+            dbg(`Trying Vite dev proxy: ${devUrl}`);
+            const res = await fetch(devUrl);
+            if (res.ok) { dbg(`Dev proxy OK`); return res; }
+            const body = await res.text().catch(() => '');
+            dbg(`Dev proxy → ${res.status}: ${body.slice(0, 120)}`);
+        } catch (e) { dbg(`Dev proxy threw: ${(e as Error).message}`); }
+    }
+
+    // Strategy 2: Direct to community proxy instances
     const instances = await getProxyInstances();
     let lastErr: Error = new Error('No proxy instances available');
-    for (const base of instances) {
+    for (const base of instances.slice(0, 4)) {
         const url = base.endsWith('/') ? `${base}${path.slice(1)}` : `${base}${path}`;
         try {
             const res = await fetch(url);
-            if (res.ok) { dbg(`Proxy OK: ${url}`); return res; }
-            dbg(`Proxy ${base} → ${res.status}`);
+            if (res.ok) { dbg(`Proxy OK: ${base}`); return res; }
+            const body = await res.text().catch(() => '');
+            dbg(`Proxy ${base} → ${res.status}: ${body.slice(0, 120)}`);
         } catch (e) { lastErr = e as Error; dbg(`Proxy ${base} threw: ${(e as Error).message}`); }
     }
     throw lastErr;
