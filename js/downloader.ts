@@ -47,25 +47,6 @@ async function getProxyInstances(): Promise<string[]> {
     return FALLBACK_INSTANCES;
 }
 
-async function proxyFetch(path: string): Promise<Response> {
-    const instances = await getProxyInstances();
-    let lastErr: Error = new Error('No proxy instances available');
-    for (const base of instances) {
-        const url = base.endsWith('/') ? `${base}${path.slice(1)}` : `${base}${path}`;
-        dbg(`Proxy attempt: ${url}`);
-        try {
-            const res = await fetch(url);
-            if (res.ok) { dbg(`Proxy hit: ${url}`); return res; }
-            dbg(`Proxy ${url} → ${res.status}`);
-            lastErr = new Error(`HTTP ${res.status} from ${base}`);
-        } catch (e) {
-            dbg(`Proxy ${base} threw: ${(e as Error).message}`);
-            lastErr = e as Error;
-        }
-    }
-    throw lastErr;
-}
-
 // ─── Auth (client credentials — for metadata only) ───────────────────────────
 
 let cachedToken: string | null = null;
@@ -99,17 +80,46 @@ async function tidalGet(path: string, params: Record<string, string> = {}): Prom
     return res.json();
 }
 
-// Playback info must go through the community proxy — client_credentials always
-// returns assetPresentation=PREVIEW regardless of the assetpresentation param.
-// The proxy instances hold subscriber tokens and return FULL manifests.
-async function getFullPlaybackInfo(id: string, quality = 'LOSSLESS'): Promise<PlaybackInfo> {
-    dbg(`Fetching playback info via proxy (quality=${quality})…`);
-    const res = await proxyFetch(`/track/?id=${id}&quality=${quality}`);
-    const json = await res.json() as { version?: string; data?: PlaybackInfo } | PlaybackInfo;
-    // Proxy may wrap response in { version, data } envelope
-    const data = ('data' in json && json.data ? json.data : json) as PlaybackInfo;
-    dbg(`assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality} bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
-    return data;
+// Playback info must go through a community proxy — client_credentials always
+// returns assetPresentation=PREVIEW. We iterate all instances and skip any that
+// return PREVIEW or a lossy quality (HIGH/LOW), accepting only LOSSLESS/HI_RES_LOSSLESS.
+async function getFullPlaybackInfo(id: string, quality = 'HI_RES_LOSSLESS'): Promise<PlaybackInfo> {
+    const instances = await getProxyInstances();
+    let lastErr: Error = new Error('No proxy instances available');
+
+    for (const base of instances) {
+        const url = `${base.endsWith('/') ? base.slice(0, -1) : base}/track/?id=${id}&quality=${quality}`;
+        dbg(`Proxy attempt: ${url}`);
+        try {
+            const res = await fetch(url);
+            if (!res.ok) {
+                dbg(`Proxy ${base} → ${res.status}`);
+                lastErr = new Error(`HTTP ${res.status} from ${base}`);
+                continue;
+            }
+            const json = await res.json() as { version?: string; data?: PlaybackInfo } | PlaybackInfo;
+            const data = ('data' in json && json.data ? json.data : json) as PlaybackInfo;
+            dbg(`Proxy ${base}: assetPresentation=${data.assetPresentation} audioQuality=${data.audioQuality}`);
+
+            if (data.assetPresentation === 'PREVIEW') {
+                dbg(`  → PREVIEW, skipping`);
+                lastErr = new Error('Proxy returned PREVIEW (no subscriber token)');
+                continue;
+            }
+            if (data.audioQuality === 'HIGH' || data.audioQuality === 'LOW') {
+                dbg(`  → lossy (${data.audioQuality}), skipping`);
+                lastErr = new Error(`Proxy returned lossy quality: ${data.audioQuality}`);
+                continue;
+            }
+
+            dbg(`  → accepted: bitDepth=${data.bitDepth} sampleRate=${data.sampleRate}`);
+            return data;
+        } catch (e) {
+            dbg(`Proxy ${base} threw: ${(e as Error).message}`);
+            lastErr = e as Error;
+        }
+    }
+    throw new Error(`No proxy returned lossless audio. Last error: ${lastErr.message}`);
 }
 
 function parseTidalId(input: string): string | null {
@@ -363,7 +373,7 @@ fetchBtn.addEventListener('click', async () => {
         setStatus('Fetching track info…', 0);
         const [meta, playback] = await Promise.all([
             tidalGet(`/v1/tracks/${trackId}/`, { countryCode: 'US' }) as Promise<TrackMeta>,
-            getFullPlaybackInfo(trackId, 'HI_RES_LOSSLESS'),
+            getFullPlaybackInfo(trackId),
         ]);
 
         currentMeta = meta;
