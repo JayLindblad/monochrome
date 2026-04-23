@@ -56,10 +56,37 @@ function coverUrl(uuid: string, size = 1280): string {
     return `https://resources.tidal.com/images/${uuid.replace(/-/g, '/')}/${size}x${size}.jpg`;
 }
 
-function proxyUrlFn(url: string): string {
-    if (url.startsWith('blob:')) return url;
-    // Proxy expects raw URL, not percent-encoded (matches existing proxy-utils.js behaviour)
-    return `${PROXY}${url}`;
+async function fetchSegment(url: string, idx: number): Promise<ArrayBuffer> {
+    // 1. Direct fetch — CloudFront signed URLs are self-contained; CORS is open for audio CDNs
+    dbg(`Seg[${idx}] trying direct: ${url.slice(0, 80)}…`);
+    try {
+        const res = await fetch(url);
+        if (res.ok) { dbg(`Seg[${idx}] direct OK (${res.status})`); return res.arrayBuffer(); }
+        dbg(`Seg[${idx}] direct failed: ${res.status}`);
+    } catch (e) {
+        dbg(`Seg[${idx}] direct threw: ${(e as Error).message}`);
+    }
+
+    // 2. Proxy with encodeURIComponent so ?Policy=… stays inside the url= param
+    const encodedProxy = `${PROXY}${encodeURIComponent(url)}`;
+    dbg(`Seg[${idx}] trying encoded proxy…`);
+    try {
+        const res = await fetch(encodedProxy);
+        if (res.ok) { dbg(`Seg[${idx}] encoded proxy OK`); return res.arrayBuffer(); }
+        dbg(`Seg[${idx}] encoded proxy failed: ${res.status}`);
+    } catch (e) {
+        dbg(`Seg[${idx}] encoded proxy threw: ${(e as Error).message}`);
+    }
+
+    // 3. Proxy raw (legacy behaviour, may lose auth params)
+    const rawProxy = `${PROXY}${url}`;
+    dbg(`Seg[${idx}] trying raw proxy…`);
+    const res = await fetch(rawProxy);
+    const hdrs: string[] = [];
+    res.headers.forEach((v, k) => hdrs.push(`${k}: ${v}`));
+    dbg(`Seg[${idx}] raw proxy ${res.status} — headers: ${hdrs.join(' | ')}`);
+    if (res.ok) return res.arrayBuffer();
+    throw new Error(`Segment ${idx} failed on all strategies (last: ${res.status})`);
 }
 
 // ─── Debug log ───────────────────────────────────────────────────────────────
@@ -155,22 +182,12 @@ async function downloadDash(manifestXml: string, onProgress: (pct: number) => vo
 
     dbg(`DASH: ${urls.length} segments, mimeType=${mimeType}`);
     dbg(`DASH seg[0] raw: ${urls[0]}`);
-    dbg(`DASH seg[0] proxied: ${proxyUrlFn(urls[0])}`);
+    dbg(`DASH seg[0] encoded-proxy: ${PROXY}${encodeURIComponent(urls[0]).slice(0, 80)}…`);
 
     for (let i = 0; i < urls.length; i++) {
         onProgress(i / urls.length);
-        const proxied = proxyUrlFn(urls[i]);
-        const res = await fetch(proxied);
-        if (!res.ok) {
-            dbg(`Segment ${i} FAILED: HTTP ${res.status} — URL: ${proxied}`);
-            // Log response headers for diagnosis
-            const hdrs: string[] = [];
-            res.headers.forEach((v, k) => hdrs.push(`${k}: ${v}`));
-            dbg(`Response headers: ${hdrs.join(' | ')}`);
-            throw new Error(`Segment ${i} fetch failed: ${res.status} (see debug log for URL)`);
-        }
-        const buf = await res.arrayBuffer();
-        dbg(`Segment ${i} OK: ${buf.byteLength} bytes`);
+        const buf = await fetchSegment(urls[i], i);
+        dbg(`Seg[${i}] received ${buf.byteLength} bytes`);
         chunks.push(buf);
     }
     onProgress(1);
@@ -330,7 +347,7 @@ downloadBtn.addEventListener('click', async () => {
             dbg(`Manifest type: JSON, urls=${JSON.stringify(parsed.urls?.slice(0, 2))}`);
             if (parsed.urls?.[0]) {
                 dbg(`Fetching manifest from URL: ${parsed.urls[0]}`);
-                const res = await fetch(proxyUrlFn(parsed.urls[0]));
+                const res = await fetch(parsed.urls[0]);
                 dbg(`Manifest fetch: HTTP ${res.status}`);
                 manifestXml = await res.text();
                 dbg(`Manifest XML (first 200 chars): ${manifestXml.slice(0, 200)}`);
